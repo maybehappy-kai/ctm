@@ -26,6 +26,7 @@ from tasks.parity.utils import prepare_model, reshape_attention_weights, reshape
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import parity_loss
 from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
+from torch.utils.tensorboard import SummaryWriter
 
 torchvision.disable_beta_transforms_warning()
 torch.serialization.add_safe_globals([argparse.Namespace])
@@ -81,6 +82,8 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='GPU(s) or -1 for CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading.')
+
     args = parser.parse_args()
     return args
 
@@ -97,9 +100,10 @@ if __name__=='__main__':
     train_data = ParityDataset(sequence_length=args.parity_sequence_length, length=100000)
     test_data = ParityDataset(sequence_length=args.parity_sequence_length, length=10000)
 
-
-    trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    testloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=0, drop_last=False)
+    trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+                                              num_workers=args.num_workers, pin_memory=True)
+    testloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True,
+                                             num_workers=args.num_workers, pin_memory=True, drop_last=False)
 
     prediction_reshaper = [args.parity_sequence_length, 2]
     args.out_dims = args.parity_sequence_length * 2
@@ -119,7 +123,11 @@ if __name__=='__main__':
         device = 'mps'
     else:
         device = 'cpu'
-    print(f'Running model {args.model} on {device}')
+    print(f'Running model {args.model_type} on {device}')
+
+    # --- 添加 TensorBoard 初始化 ---
+    writer = SummaryWriter(log_dir=f'{args.log_dir}/tensorboard')
+    # -----------------------------
 
     # Build model
     model = prepare_model(prediction_reshaper, args, device)
@@ -230,6 +238,12 @@ if __name__=='__main__':
             accuracy_finegrained = (predictions.argmax(2)[torch.arange(predictions.size(0), device=predictions.device),:,where_most_certain] == targets).float().mean().item()
             pbar.set_description(f'Dataset=Parity. Loss={loss.item():0.3f}. Accuracy={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})')
 
+            # --- 添加 TensorBoard 记录 ---
+            if writer:
+                writer.add_scalar('Loss/train', loss.item(), bi)
+                writer.add_scalar('LearningRate', current_lr, bi)
+            # -----------------------------
+
             # Metrics tracking and plotting
             if bi%args.track_every==0:# and bi != 0:
                 model.eval()
@@ -303,6 +317,13 @@ if __name__=='__main__':
                         train_accuracies_most_certain_per_input.append((all_targets == all_predictions_most_certain).reshape(all_targets.shape[0], -1).all(-1).mean())
                         train_losses.append(np.mean(all_losses))
 
+                        # --- 添加 TensorBoard 记录 ---
+                        if writer:
+                            writer.add_scalar('Loss/train_eval', train_losses[-1], bi)
+                            writer.add_scalar('Accuracy/train_per_input', train_accuracies_most_certain_per_input[-1],
+                                              bi)
+                        # -----------------------------
+
                         ##################################### TEST METRICS
                         all_predictions = []
                         all_predictions_most_certain = []
@@ -337,6 +358,12 @@ if __name__=='__main__':
                         test_accuracies_most_certain.append((all_targets == all_predictions_most_certain).mean())
                         test_accuracies_most_certain_per_input.append((all_targets == all_predictions_most_certain).reshape(all_targets.shape[0], -1).all(-1).mean())
                         test_losses.append(np.mean(all_losses))
+
+                        # --- 添加 TensorBoard 记录 ---
+                        if writer:
+                            writer.add_scalar('Loss/test', test_losses[-1], bi)
+                            writer.add_scalar('Accuracy/test_per_input', test_accuracies_most_certain_per_input[-1], bi)
+                        # -----------------------------
                             
 
                         figacc = plt.figure(figsize=(10, 10))
@@ -400,7 +427,14 @@ if __name__=='__main__':
                     'numpy_rng_state': np.random.get_state(),
                     'random_rng_state': random.getstate(),
                     } , f'{args.log_dir}/checkpoint_{bi}.pt')
-            
+
             pbar.update(1)
+
+    # --- 添加关闭 writer 的代码 ---
+    if writer:
+        writer.close()
+    # -----------------------------
+
+
 
 
