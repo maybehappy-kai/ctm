@@ -1,3 +1,6 @@
+# 文件路径: tasks/parity/dynamic_training/train_st_ctm.py
+# (完整替换后的内容)
+
 import argparse
 import math
 import multiprocessing
@@ -5,6 +8,7 @@ import os
 import random
 import torch
 import numpy as np
+import time  # 引入time模块用于调试
 
 # 确保在导入pyplot之前设置后端
 import matplotlib as mpl
@@ -20,22 +24,21 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
 import torchvision
 from tqdm.auto import tqdm
-
-from data.custom_datasets import ParityDataset
-from tasks.parity.utils import prepare_model
-from utils.housekeeping import set_seed, zip_python_code
-from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 from torch.utils.tensorboard import SummaryWriter
 
-# from tasks.parity.utils import prepare_model
+# +++ 修改：从新的隔离文件中导入数据集 +++
+from tasks.parity.dynamic_training.st_datasets import InMemoryParityDataset, TransitionDataset
+# +++++++++++++++++++++++++++++++++++++
+
 from tasks.parity.dynamic_training.st_ctm import ContinuousThoughtMachine as ST_CTM
 from models.utils import reshape_predictions
+from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import parity_loss
+from utils.schedulers import WarmupCosineAnnealingLR
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 torchvision.disable_beta_transforms_warning()
-# 允许安全地加载包含argparse.Namespace的checkpoint
 torch.serialization.add_safe_globals([argparse.Namespace])
 
 
@@ -44,7 +47,6 @@ def prepare_st_ctm_model(prediction_reshaper, args, device):
     一个专门用于初始化我们的ST_CTM的辅助函数。
     """
     model = ST_CTM(
-        # ... (将 prepare_model 中的所有参数复制到这里) ...
         iterations=args.iterations,
         d_model=args.d_model,
         d_input=args.d_input,
@@ -62,73 +64,47 @@ def prepare_st_ctm_model(prediction_reshaper, args, device):
         prediction_reshaper=prediction_reshaper,
         dropout=args.dropout,
         neuron_select_type=args.neuron_select_type,
-        n_random_pairing_self=0,  # 在parity任务中未使用
+        n_random_pairing_self=0,
     ).to(device)
     return model
 
 
-def calculate_loss_and_certainty(state_package, targets, prediction_reshaper):
-    """
-    一个辅助函数，用于从一个状态包中计算损失和确定性。
-    """
-    # 为单个样本添加批次维度 (B=1)，以匹配工具函数期望的输入形状
-    predictions = state_package["prediction"].unsqueeze(0).unsqueeze(-1)
-    certainties = state_package["certainty"].unsqueeze(0).unsqueeze(-1)
-
-    predictions = reshape_predictions(predictions, prediction_reshaper)
-
-    # Parity loss for a single tick. Note: use_most_certain is False as we provide only one tick.
-    loss, _ = parity_loss(predictions, certainties, targets, use_most_certain=False)
-
-    # 确定性是 state_package 中 certainty 张量的第二个元素
-    certainty = state_package["certainty"][1].item()
-
-    return loss.item(), certainty
-
-
-# 路径: tasks/parity/dynamic_training/st_ctm.py
-# 请用下面的函数替换您文件中已有的 generate_and_filter_data 函数
-
 def generate_and_filter_data(ensemble_models, data_loader, args, device, prediction_reshaper):
     """
-    [性能优化版 - 仅混合精度]
+    [性能优化版 - JIT编译 & 延迟CPU传输]
     阶段一和阶段二：生成和筛选优质思考片段。
-    - 使用 torch.autocast (AMP) 进行混合精度推断，以加速计算并降低显存。
-    - 采用预分配-填充策略（已在st_ctm.py的forward中实现）来避免动态内存分配。
-    - 直接返回一个包含所有数据的张量字典，避免最后的CPU串行循环。
     """
-    all_filtered_data = []
+    all_filtered_data_gpu = []
+    total_samples_generated = 0
 
     pbar = tqdm(total=len(ensemble_models) * len(data_loader),
-                desc="[Phase 1&2] Generating & Filtering Data (AMP Enabled)")
+                desc="[Phase 1&2] Generating & Filtering Data")
 
-    for model in ensemble_models:
+    for model_idx, model in enumerate(ensemble_models):
         model.eval()
-        # 临时为数据生成阶段设置更长的思考步数
         original_iterations = model.iterations
         model.iterations = args.data_gen_ticks
 
-        for inputs, targets in data_loader:
+        batch_start_time = time.time()
+        for batch_idx, (inputs, targets) in enumerate(data_loader):
+            tqdm.write(
+                f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Processing...")
+
             inputs, targets = inputs.to(device), targets.to(device)
             batch_size = inputs.size(0)
 
-            # --- 核心优化: 混合精度推断 ---
             with torch.no_grad():
                 with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16,
                                     enabled=args.use_amp):
-                    # 前向传播现在返回一个张量字典
                     state_history_tensors = model(inputs, return_state_history=True)
 
                     if not state_history_tensors:
                         pbar.update(1)
                         continue
 
-                # --- 数据提取和筛选（直接操作大张量） ---
-                # 将张量移回FP32进行后续的CPU计算，以保证数值稳定性
-                all_predictions = state_history_tensors["prediction"].float().permute(1, 2, 0)  # B, C, T
-                all_certainties = state_history_tensors["certainty"].float().permute(1, 2, 0)  # B, 2, T
+                all_predictions = state_history_tensors["prediction"].float().permute(1, 2, 0)
+                all_certainties = state_history_tensors["certainty"].float().permute(1, 2, 0)
 
-                # 计算损失的逻辑保持不变，因为它已经是向量化的
                 reshaped_preds_for_loss = all_predictions.reshape(batch_size, args.parity_sequence_length, 2,
                                                                   args.data_gen_ticks).permute(0, 3, 1, 2).reshape(-1,
                                                                                                                    args.parity_sequence_length,
@@ -141,9 +117,8 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 losses_all_ticks = per_element_loss.mean(dim=2)
                 certainties_all_ticks = all_certainties[:, 1, :]
 
-                # 筛选逻辑保持不变
                 losses_tm1, losses_t, losses_tp1 = losses_all_ticks[:, :-2], losses_all_ticks[:, 1:-1], \
-                losses_all_ticks[:, 2:]
+                    losses_all_ticks[:, 2:]
                 certs_tm1, certs_t = certainties_all_ticks[:, :-2], certainties_all_ticks[:, 1:-1]
                 cond1 = (losses_t < losses_tm1) & (certs_t > certs_tm1)
                 cond2 = (losses_tp1 < losses_t)
@@ -151,92 +126,68 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 batch_indices, tick_indices_t = torch.where(good_indices_mask)
 
                 if batch_indices.numel() > 0:
+                    num_found = batch_indices.numel()
+                    total_samples_generated += num_found
+                    tqdm.write(
+                        f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Found {num_found} good samples!")
+
                     input_tick_indices = tick_indices_t
                     target_tick_indices = tick_indices_t + 2
 
-                    # --- 直接从预分配的张量中高效索引，无需循环 ---
                     batch_data = {}
-                    # 在将数据移到CPU之前，先在GPU上完成所有索引操作
-                    batch_data["kv"] = model.compute_features(inputs)[batch_indices].detach().cpu()
-                    batch_data["targets"] = targets[batch_indices].detach().cpu()
+                    batch_data["kv"] = model.compute_features(inputs)[batch_indices].detach()
+                    batch_data["targets"] = targets[batch_indices].detach()
 
                     for key, tensor_history in state_history_tensors.items():
                         if key.startswith('recursive_sync'): continue
+                        batch_data[f"input_{key}"] = tensor_history[input_tick_indices, batch_indices].detach()
+                        batch_data[f"target_{key}"] = tensor_history[target_tick_indices, batch_indices].detach()
 
-                        # tensor_history shape is (T, B, ...)
-                        batch_data[f"input_{key}"] = tensor_history[input_tick_indices, batch_indices].detach().cpu()
-                        batch_data[f"target_{key}"] = tensor_history[target_tick_indices, batch_indices].detach().cpu()
-
-                    all_filtered_data.append(batch_data)
+                    all_filtered_data_gpu.append(batch_data)
 
             pbar.update(1)
-        # 恢复模型原始的迭代次数
+            batch_end_time = time.time()
+            tqdm.write(
+                f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Time taken: {batch_end_time - batch_start_time:.2f}s")
+            batch_start_time = time.time()
+
         model.iterations = original_iterations
 
     pbar.close()
 
-    if not all_filtered_data:
-        print("Warning: No expert transition samples were generated.")
+    tqdm.write(
+        f"[DEBUG] {time.strftime('%H:%M:%S')} - TOTAL SAMPLES GENERATED IN THIS EPOCH: {total_samples_generated}")
+
+    if not all_filtered_data_gpu:
+        tqdm.write("[WARNING] No expert transition samples were generated in this epoch.")
         return None
 
-    # 将所有批次的数据合并成一个大的张量字典
+    tqdm.write("Consolidating and transferring data to CPU...")
     final_expert_data = {}
-    for key in all_filtered_data[0].keys():
-        final_expert_data[key] = torch.cat([d[key] for d in all_filtered_data], dim=0)
+    keys = all_filtered_data_gpu[0].keys()
+    for key in keys:
+        final_expert_data[key] = torch.cat([d[key] for d in all_filtered_data_gpu], dim=0).cpu()
 
-    print(f"Generated and filtered {final_expert_data['targets'].shape[0]} expert transition samples.")
+    tqdm.write(f"Generated and filtered a total of {final_expert_data['targets'].shape[0]} expert transition samples.")
     return final_expert_data
 
 
-# """
-# 修改
-# """
 def define_state_loss(predicted_states, target_states):
     """
     定义用于比较两个状态包的损失函数。
     """
     total_loss = 0
-
-    # 1. 后激活值 (z) 的损失
     total_loss += torch.nn.functional.mse_loss(predicted_states[0]["activated_state"], target_states["activated_state"])
     total_loss += torch.nn.functional.mse_loss(predicted_states[1]["activated_state"], target_states["activated_state"])
-
-    # 2. 注意力输出 (o) 的损失
     total_loss += torch.nn.functional.mse_loss(predicted_states[0]["attention_output"],
                                                target_states["attention_output"])
-
-    # 3. 预测 (y) 的损失
     total_loss += torch.nn.functional.mse_loss(predicted_states[1]["prediction"], target_states["prediction"])
-
-    # 还可以添加其他状态的损失，但以上是最关键的
     return total_loss
 
 
-# tasks/parity/dynamic_training/st_ctm.py
-
-class TransitionDataset(Dataset):
-    """
-    [重构优化版]
-    存储批处理后的张量字典，并按索引返回单个样本的所有状态信息。
-    """
-    def __init__(self, expert_data_dict):
-        # expert_data_dict 是 generate_and_filter_data 返回的张量字典
-        self.data = expert_data_dict
-        # 假设所有张量的第一个维度都是样本数
-        self.num_samples = self.data['targets'].shape[0]
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        # 返回一个字典，其中每个值都是对应索引处的张量切片
-        sample = {key: tensor[idx] for key, tensor in self.data.items()}
-        return sample
-
 def parse_args():
-    # 复用原始的参数解析，并为新范式添加特定参数
     parser = argparse.ArgumentParser(description="Train a State-Transition CTM on the Parity Task")
-
+    # ... (参数部分与您文件中的保持一致，此处省略以保持简洁)
     # --- 原始模型与任务参数 ---
     parser.add_argument('--model_type', type=str, default="ctm", choices=['ctm'],
                         help='Model type must be CTM for this paradigm.')
@@ -289,35 +240,29 @@ def parse_args():
 
 
 if __name__ == '__main__':
-    # --- 1. 初始化和设置 ---
     args = parse_args()
     set_seed(args.seed)
     if not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
 
-    # 保存代码和参数以保证可复现性
     zip_python_code(os.path.join(args.log_dir, 'repo_state.zip'))
     with open(os.path.join(args.log_dir, 'args.txt'), 'w') as f:
         print(args, file=f)
 
-    # 设置设备
     if args.device[0] != -1 and torch.cuda.is_available():
         device = f'cuda:{args.device[0]}'
     else:
         device = 'cpu'
     print(f"Running new CTM training paradigm on device: {device}")
 
-    # --- 2. 准备模型 (ST-CTM Unit) ---
-    # 注意：这里的iterations参数将被用于推理，而不是固定的训练循环
-    # 我们将使用“双步思考”单元，所以模型本身仍然定义为标准的CTM
-    args.iterations = 2  # 设定为2以匹配“双步思考”单元
+    writer = SummaryWriter(log_dir=f'{args.log_dir}/tensorboard')
+
+    args.iterations = 2
     prediction_reshaper = [args.parity_sequence_length, 2]
     args.out_dims = args.parity_sequence_length * 2
 
-    # 初始化模型
     model = prepare_st_ctm_model(prediction_reshaper, args, device)
 
-    # 打印模型参数量
     try:
         pseudo_inputs = torch.randn(1, args.parity_sequence_length).to(device)
         model(pseudo_inputs)
@@ -325,120 +270,79 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Could not perform pseudo-forward pass: {e}")
 
-    # --- 3. 准备数据加载器 ---
-    # 我们仍然需要一个数据加载器来获取原始的奇偶校验问题实例
-    train_data = ParityDataset(sequence_length=args.parity_sequence_length, length=100000)
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
-                                               num_workers=args.num_workers, pin_memory=True)
+    print("Initializing InMemoryParityDataset...")
+    train_data = InMemoryParityDataset(sequence_length=args.parity_sequence_length, length=100000)
+    train_loader = DataLoader(train_data,
+                              batch_size=args.batch_size,
+                              shuffle=True,
+                              num_workers=args.num_workers,
+                              pin_memory=True,
+                              persistent_workers=True if args.num_workers > 0 else False)
 
-    # --- 4. 准备优化器和调度器 ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = WarmupCosineAnnealingLR(optimizer, args.warmup_steps, args.training_iterations)
 
-    # --- 5. 新的训练范式实现区域 ---
     print("\n" + "=" * 50)
     print("      New CTM Training Paradigm - Starting...")
     print("=" * 50 + "\n")
 
-    # ------------------ 阶段一 & 二: 数据生成与筛选 ------------------
-    # 创建一个模型集成用于生成多样化数据
-    ensemble_models = []
-    for i in range(args.num_ensemble_models):
-        print(f"Initializing ensemble model {i + 1}/{args.num_ensemble_models}...")
-        # 注意：每个模型都需要自己的随机种子以保证多样性
-        set_seed(args.seed + i)
-        ensemble_model = prepare_st_ctm_model(prediction_reshaper, args, device)
-        # 这里可以加载不同的预训练权重，但目前我们从随机初始化开始
-        ensemble_model.eval()  # 设置为评估模式
-        ensemble_models.append(ensemble_model)
+    print("Initializing ensemble models for data generation...")
+    ensemble_models = [prepare_st_ctm_model(prediction_reshaper, args, device) for i in range(args.num_ensemble_models)]
+    for i, m in enumerate(ensemble_models):
+        set_seed(args.seed + i + 1)
+        m.eval()
 
-    # 重置主模型的种子
     set_seed(args.seed)
 
     expert_transitions = generate_and_filter_data(ensemble_models, train_loader, args, device, prediction_reshaper)
 
-    # 将筛选出的片段封装成数据集和数据加载器
-    expert_dataset = TransitionDataset(final_expert_data)
-    # 注意：这里的 batch_size 可以设置得很大，因为训练是并行的
+    if expert_transitions is None:
+        print("Stopping training as no expert data was generated.")
+        exit()
+
+    expert_dataset = TransitionDataset(expert_transitions)
     expert_loader = DataLoader(expert_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
-
-    # ------------------ 阶段三: 并行化监督训练 ------------------
-    model.train()  # 确保主模型处于训练模式
+    model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
     expert_iterator = iter(expert_loader)
 
     with tqdm(total=args.training_iterations, initial=0, desc="[Phase 3] Training ST-CTM Unit") as pbar:
         for bi in range(args.training_iterations):
             try:
-                input_states, target_states, contexts = next(expert_iterator)
+                batch_data = next(expert_iterator)
             except StopIteration:
                 expert_iterator = iter(expert_loader)
-                input_states, target_states, contexts = next(expert_iterator)
+                batch_data = next(expert_iterator)
 
-            # 将所有数据移动到设备
-            input_states = {k: v.to(device) if isinstance(v, torch.Tensor) else (v[0].to(device), v[1].to(device)) for
-                            k, v in input_states.items()}
-            target_states = {k: v.to(device) for k, v in target_states.items()}
-            contexts = {k: v.to(device) for k, v in contexts.items()}
+            # --- Move data to device ---
+            # 这部分需要根据 TransitionDataset 的 __getitem__ 返回结构来调整
+            # 假设返回的是 (input_dict, target_dict)
+            input_dict = {k.replace('input_', ''): v.to(device) for k, v in batch_data.items() if
+                          k.startswith('input_')}
+            target_dict = {k.replace('target_', ''): v.to(device) for k, v in batch_data.items() if
+                           k.startswith('target_')}
 
             # --- 执行双步前向传播 ---
-            # 这是一个简化的前向传播，我们需要构建一个能执行双步的函数
-            # 这里我们直接在循环中实现
-
-            # 注入静态KV
-            model.kv_features = contexts["kv"].squeeze(1)
-
-            # --- Tick 1 ---
-            # 从输入状态包中提取初始状态
-            state_trace_t0 = input_states["state_trace"]
-            activated_state_t0 = input_states["activated_state"]
-            attn_out_t0 = input_states["attention_output"]
-            decay_alpha_action_t0, decay_beta_action_t0 = input_states["recursive_sync_action"]
-            decay_alpha_out_t0, decay_beta_out_t0 = input_states["recursive_sync_out"]
-
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16,
                                 enabled=args.use_amp):
-                # 手动执行第一个tick的计算
-                pre_synapse_input_t1 = torch.cat((attn_out_t0, activated_state_t0), dim=-1)
-                state_t1 = model.synapses(pre_synapse_input_t1)
-                state_trace_t1 = torch.cat((state_trace_t0[:, :, 1:], state_t1.unsqueeze(-1)), dim=-1)
-                activated_state_t1 = model.trace_processor(state_trace_t1)
+                # model.run_two_ticks 是一个需要你在 st_ctm.py 中实现的新方法
+                predicted_final_state, _ = model.run_two_ticks(input_dict)
+                loss = define_state_loss(predicted_final_state, target_dict)
 
-                # ... (此处省略了第一个tick的同步和注意力计算，因为我们只需要最终输出)
-
-                # --- Tick 2 ---
-                # 为了简化，我们直接使用 target_states 中的 attention_output 作为 o_t1
-                # 这是一个近似，一个更完整的实现会重新计算它
-                pre_synapse_input_t2 = torch.cat((target_states["attention_output"], activated_state_t1), dim=-1)
-                state_t2 = model.synapses(pre_synapse_input_t2)
-                state_trace_t2 = torch.cat((state_trace_t1[:, :, 1:], state_t2.unsqueeze(-1)), dim=-1)
-                activated_state_t2 = model.trace_processor(state_trace_t2)
-
-                # 重新计算第二个tick的同步和预测
-                r_out = torch.exp(-torch.clamp(model.decay_params_out, 0, 15)).unsqueeze(0).expand(args.batch_size, -1)
-                _, d_alpha_out_t1, d_beta_out_t1 = model.compute_synchronisation(activated_state_t1, decay_alpha_out_t0,
-                                                                                 decay_beta_out_t0, r_out, 'out')
-                sync_out_t2, _, _ = model.compute_synchronisation(activated_state_t2, d_alpha_out_t1, d_beta_out_t1,
-                                                                  r_out, 'out')
-                prediction_t2 = model.output_projector(sync_out_t2)
-
-                # --- 定义损失 ---
-                # 简化的损失，只监督最终的预测
-                loss = torch.nn.functional.mse_loss(prediction_t2, target_states["prediction"])
-
-            # --- 反向传播 ---
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
+            writer.add_scalar('Loss/state_transition', loss.item(), bi)
+            writer.add_scalar('LearningRate', scheduler.get_last_lr()[0], bi)
+
             pbar.set_description(
                 f"[Phase 3] Training ST-CTM Unit | Iter {bi + 1}/{args.training_iterations} | Loss: {loss.item():.4f}")
             pbar.update(1)
 
-            # --- 定期保存模型 ---
             if (bi + 1) % args.save_every == 0:
                 torch.save({
                     'model_state_dict': model.state_dict(),
@@ -448,3 +352,4 @@ if __name__ == '__main__':
                 }, os.path.join(args.log_dir, f'checkpoint_{bi + 1}.pt'))
 
     print("Training of ST-CTM Unit complete.")
+    writer.close()
