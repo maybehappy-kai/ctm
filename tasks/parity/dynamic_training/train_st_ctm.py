@@ -86,20 +86,25 @@ def calculate_loss_and_certainty(state_package, targets, prediction_reshaper):
     return loss.item(), certainty
 
 
-# """
-# 修改
-# """
+# 路径: tasks/parity/dynamic_training/st_ctm.py
+# 请用下面的函数替换您文件中已有的 generate_and_filter_data 函数
+
 def generate_and_filter_data(ensemble_models, data_loader, args, device, prediction_reshaper):
     """
+    [性能优化版 - 仅混合精度]
     阶段一和阶段二：生成和筛选优质思考片段。
-    采用“双步思考单元”的逻辑进行筛选。
-    [最终优化版：全批次向量化索引与提取]
+    - 使用 torch.autocast (AMP) 进行混合精度推断，以加速计算并降低显存。
+    - 采用预分配-填充策略（已在st_ctm.py的forward中实现）来避免动态内存分配。
+    - 直接返回一个包含所有数据的张量字典，避免最后的CPU串行循环。
     """
-    expert_transitions = []
-    pbar = tqdm(total=len(ensemble_models) * len(data_loader), desc="[Phase 1&2] Generating & Filtering Data")
+    all_filtered_data = []
+
+    pbar = tqdm(total=len(ensemble_models) * len(data_loader),
+                desc="[Phase 1&2] Generating & Filtering Data (AMP Enabled)")
 
     for model in ensemble_models:
         model.eval()
+        # 临时为数据生成阶段设置更长的思考步数
         original_iterations = model.iterations
         model.iterations = args.data_gen_ticks
 
@@ -107,17 +112,23 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
             inputs, targets = inputs.to(device), targets.to(device)
             batch_size = inputs.size(0)
 
+            # --- 核心优化: 混合精度推断 ---
             with torch.no_grad():
-                # 1. 一次性为整个批次生成状态历史 (这是一个 list of dicts)
-                state_history = model(inputs, return_state_history=True)
-                if not state_history:
-                    pbar.update(1)
-                    continue
+                with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16,
+                                    enabled=args.use_amp):
+                    # 前向传播现在返回一个张量字典
+                    state_history_tensors = model(inputs, return_state_history=True)
 
-                # 2. 向量化计算所有ticks的损失和确定性 (与之前相同)
-                all_predictions = torch.stack([s['prediction'] for s in state_history], dim=2)
-                all_certainties = torch.stack([s['certainty'] for s in state_history], dim=2)
+                    if not state_history_tensors:
+                        pbar.update(1)
+                        continue
 
+                # --- 数据提取和筛选（直接操作大张量） ---
+                # 将张量移回FP32进行后续的CPU计算，以保证数值稳定性
+                all_predictions = state_history_tensors["prediction"].float().permute(1, 2, 0)  # B, C, T
+                all_certainties = state_history_tensors["certainty"].float().permute(1, 2, 0)  # B, 2, T
+
+                # 计算损失的逻辑保持不变，因为它已经是向量化的
                 reshaped_preds_for_loss = all_predictions.reshape(batch_size, args.parity_sequence_length, 2,
                                                                   args.data_gen_ticks).permute(0, 3, 1, 2).reshape(-1,
                                                                                                                    args.parity_sequence_length,
@@ -130,7 +141,7 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 losses_all_ticks = per_element_loss.mean(dim=2)
                 certainties_all_ticks = all_certainties[:, 1, :]
 
-                # 3. 向量化筛选“优质”转换 (与之前相同)
+                # 筛选逻辑保持不变
                 losses_tm1, losses_t, losses_tp1 = losses_all_ticks[:, :-2], losses_all_ticks[:, 1:-1], \
                 losses_all_ticks[:, 2:]
                 certs_tm1, certs_t = certainties_all_ticks[:, :-2], certainties_all_ticks[:, 1:-1]
@@ -139,92 +150,42 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 good_indices_mask = cond1 & cond2
                 batch_indices, tick_indices_t = torch.where(good_indices_mask)
 
-                # 4. 彻底的批次化提取
                 if batch_indices.numel() > 0:
                     input_tick_indices = tick_indices_t
                     target_tick_indices = tick_indices_t + 2
 
-                    # --- 核心性能优化：将历史列表转换为历史字典 ---
-                    history_dict = {k: torch.stack(
-                        [s[k] if not isinstance(s[k], tuple) else torch.stack(s[k], dim=0) for s in state_history],
-                        dim=0) for k in state_history[0].keys()}
-                    # 结果是，例如 history_dict['activated_state'] 的形状为 (T, B, D)
+                    # --- 直接从预分配的张量中高效索引，无需循环 ---
+                    batch_data = {}
+                    # 在将数据移到CPU之前，先在GPU上完成所有索引操作
+                    batch_data["kv"] = model.compute_features(inputs)[batch_indices].detach().cpu()
+                    batch_data["targets"] = targets[batch_indices].detach().cpu()
 
-                    # --- 使用高级索引一次性提取所有数据 ---
-                    kv_context = model.compute_features(inputs)[batch_indices].detach().cpu()
-                    targets_context = targets[batch_indices].detach().cpu()
+                    for key, tensor_history in state_history_tensors.items():
+                        if key.startswith('recursive_sync'): continue
 
-                    input_states_batch = {}
-                    target_states_batch = {}
-                    for key, tensor_history in history_dict.items():
-                        if key.startswith('recursive_sync'):
-                            # 对元组的特殊处理
-                            alpha_in = tensor_history[input_tick_indices, 0, batch_indices].detach().cpu()
-                            beta_in = tensor_history[input_tick_indices, 1, batch_indices].detach().cpu()
-                            input_states_batch[key] = (alpha_in, beta_in)
+                        # tensor_history shape is (T, B, ...)
+                        batch_data[f"input_{key}"] = tensor_history[input_tick_indices, batch_indices].detach().cpu()
+                        batch_data[f"target_{key}"] = tensor_history[target_tick_indices, batch_indices].detach().cpu()
 
-                            alpha_tgt = tensor_history[target_tick_indices, 0, batch_indices].detach().cpu()
-                            beta_tgt = tensor_history[target_tick_indices, 1, batch_indices].detach().cpu()
-                            target_states_batch[key] = (alpha_tgt, beta_tgt)
-                        else:
-                            input_states_batch[key] = tensor_history[input_tick_indices, batch_indices].detach().cpu()
-                            target_states_batch[key] = tensor_history[target_tick_indices, batch_indices].detach().cpu()
-
-                    # --- 在CPU上快速重组为最终列表 ---
-                    for i in range(batch_indices.numel()):
-                        input_state = {k: v[i] if not isinstance(v, tuple) else (v[0][i], v[1][i]) for k, v in
-                                       input_states_batch.items()}
-                        target_state = {k: v[i] if not isinstance(v, tuple) else (v[0][i], v[1][i]) for k, v in
-                                        target_states_batch.items()}
-                        context = {"kv": kv_context[i], "targets": targets_context[i]}
-                        expert_transitions.append((input_state, target_state, context))
+                    all_filtered_data.append(batch_data)
 
             pbar.update(1)
+        # 恢复模型原始的迭代次数
         model.iterations = original_iterations
 
     pbar.close()
-    print(f"Generated and filtered {len(expert_transitions)} expert transition samples.")
-    return expert_transitions
 
-# """
-# 修改
-# """
-def collate_fn(batch):
-    """
-    自定义的collate_fn，用于将状态包列表正确地堆叠成批次。
-    """
-    input_states, target_states, contexts = zip(*batch)
+    if not all_filtered_data:
+        print("Warning: No expert transition samples were generated.")
+        return None
 
-    collated_input = {}
-    collated_target = {}
-    collated_context = {}
+    # 将所有批次的数据合并成一个大的张量字典
+    final_expert_data = {}
+    for key in all_filtered_data[0].keys():
+        final_expert_data[key] = torch.cat([d[key] for d in all_filtered_data], dim=0)
 
-    # 提取第一个样本以获取所有的键
-    input_keys = input_states[0].keys()
-    target_keys = target_states[0].keys()
-    context_keys = contexts[0].keys()
-
-    for key in input_keys:
-        # 特殊处理元组形式的递归同步状态
-        if key.startswith('recursive_sync'):
-            alpha_list = [state[key][0] for state in input_states]
-            beta_list = [state[key][1] for state in input_states]
-            collated_input[key] = (torch.stack(alpha_list, dim=0), torch.stack(beta_list, dim=0))
-        else:
-            collated_input[key] = torch.stack([state[key] for state in input_states], dim=0)
-
-    for key in target_keys:
-        if key.startswith('recursive_sync'):
-            alpha_list = [state[key][0] for state in target_states]
-            beta_list = [state[key][1] for state in target_states]
-            collated_target[key] = (torch.stack(alpha_list, dim=0), torch.stack(beta_list, dim=0))
-        else:
-            collated_target[key] = torch.stack([state[key] for state in target_states], dim=0)
-
-    for key in context_keys:
-        collated_context[key] = torch.stack([ctx[key] for ctx in contexts], dim=0)
-
-    return collated_input, collated_target, collated_context
+    print(f"Generated and filtered {final_expert_data['targets'].shape[0]} expert transition samples.")
+    return final_expert_data
 
 
 # """
@@ -251,23 +212,26 @@ def define_state_loss(predicted_states, target_states):
     return total_loss
 
 
-# """
-# # 修改
-# """
+# tasks/parity/dynamic_training/st_ctm.py
+
 class TransitionDataset(Dataset):
     """
-    一个用于存储和加载 (输入状态, 目标状态) 对的自定义数据集。
+    [重构优化版]
+    存储批处理后的张量字典，并按索引返回单个样本的所有状态信息。
     """
-
-    def __init__(self, transitions):
-        self.transitions = transitions
+    def __init__(self, expert_data_dict):
+        # expert_data_dict 是 generate_and_filter_data 返回的张量字典
+        self.data = expert_data_dict
+        # 假设所有张量的第一个维度都是样本数
+        self.num_samples = self.data['targets'].shape[0]
 
     def __len__(self):
-        return len(self.transitions)
+        return self.num_samples
 
     def __getitem__(self, idx):
-        input_state, target_state, context = self.transitions[idx]
-        return input_state, target_state, context
+        # 返回一个字典，其中每个值都是对应索引处的张量切片
+        sample = {key: tensor[idx] for key, tensor in self.data.items()}
+        return sample
 
 def parse_args():
     # 复用原始的参数解析，并为新范式添加特定参数
@@ -394,9 +358,9 @@ if __name__ == '__main__':
     expert_transitions = generate_and_filter_data(ensemble_models, train_loader, args, device, prediction_reshaper)
 
     # 将筛选出的片段封装成数据集和数据加载器
-    expert_dataset = TransitionDataset(expert_transitions)
+    expert_dataset = TransitionDataset(final_expert_data)
     # 注意：这里的 batch_size 可以设置得很大，因为训练是并行的
-    expert_loader = DataLoader(expert_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
+    expert_loader = DataLoader(expert_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
 
     # ------------------ 阶段三: 并行化监督训练 ------------------
