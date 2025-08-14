@@ -502,6 +502,19 @@ class ContinuousThoughtMachine(nn.Module):
         # for state-transition training
         state_history = []
 
+        # --- 核心修改：预分配内存 ---
+        if return_state_history:
+            # 不再使用 list of dicts，而是创建一个字典，值为预分配好的大张量
+            state_history_tensors = {
+                "activated_state": torch.empty(self.iterations, B, self.d_model, device=device, dtype=x.dtype),
+                "state_trace": torch.empty(self.iterations, B, self.d_model, self.memory_length, device=device,
+                                           dtype=x.dtype),
+                "attention_output": torch.empty(self.iterations, B, self.d_input, device=device, dtype=x.dtype),
+                "prediction": torch.empty(self.iterations, B, self.out_dims, device=device, dtype=x.dtype),
+                "certainty": torch.empty(self.iterations, B, 2, device=device, dtype=x.dtype),
+                # 对于递归同步状态，仍然可以保留为Python变量，因为它们的更新是独立的
+            }
+
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
 
@@ -561,18 +574,15 @@ class ContinuousThoughtMachine(nn.Module):
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
-            # --- Store current state for state-transition training ---
+            # --- 核心修改：原地填充 ---
             if return_state_history:
-                current_state_package = {
-                    "activated_state": activated_state,  # z
-                    "state_trace": state_trace,  # A (pre-activation history)
-                    "attention_output": attn_out,  # o
-                    "recursive_sync_action": (decay_alpha_action, decay_beta_action),  # (α_action, β_action)
-                    "recursive_sync_out": (decay_alpha_out, decay_beta_out),  # (α_out, β_out)
-                    "prediction": current_prediction,  # y
-                    "certainty": current_certainty  # C
-                }
-                state_history.append(current_state_package)
+                state_history_tensors["activated_state"][stepi] = activated_state
+                state_history_tensors["state_trace"][stepi] = state_trace
+                state_history_tensors["attention_output"][stepi] = attn_out
+                state_history_tensors["prediction"][stepi] = current_prediction
+                state_history_tensors["certainty"][stepi] = current_certainty
+                # 递归同步状态的更新逻辑不变
+
 
             # --- Tracking ---
             if track:
@@ -584,7 +594,12 @@ class ContinuousThoughtMachine(nn.Module):
 
         # --- Return Values ---
         if return_state_history:
-            return state_history
+            # 将递归状态也加入字典
+            # 注意：这里我们只返回了最后一个tick的状态，如果筛选时需要历史，逻辑需要调整
+            # 但根据我们之前的讨论，筛选依赖的是预测和确定性历史，这些已经在张量里了。
+            # state_history_tensors["recursive_sync_action"] = (decay_alpha_action, decay_beta_action)
+            # state_history_tensors["recursive_sync_out"] = (decay_alpha_out, decay_beta_out)
+            return state_history_tensors
 
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(
