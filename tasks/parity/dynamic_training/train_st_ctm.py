@@ -271,7 +271,7 @@ if __name__ == '__main__':
         print(f"Could not perform pseudo-forward pass: {e}")
 
     print("Initializing InMemoryParityDataset...")
-    train_data = InMemoryParityDataset(sequence_length=args.parity_sequence_length, length=100000)
+    train_data = InMemoryParityDataset(sequence_length=args.parity_sequence_length, length=10000)
     train_loader = DataLoader(train_data,
                               batch_size=args.batch_size,
                               shuffle=True,
