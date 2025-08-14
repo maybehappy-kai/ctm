@@ -52,4 +52,4 @@ python -m tasks.parity.dynamic_training.train_st_ctm \
     --save_every $SAVE_EVERY \
     --device 1 \
     --use_amp \
-    --num_workers 64
+    --num_workers 16
