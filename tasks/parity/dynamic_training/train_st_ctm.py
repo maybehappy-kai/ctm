@@ -71,11 +71,17 @@ def prepare_st_ctm_model(prediction_reshaper, args, device):
 
 def generate_and_filter_data(ensemble_models, data_loader, args, device, prediction_reshaper):
     """
-    [性能优化版 - JIT编译 & 延迟CPU传输]
+    [性能优化版 V2 - 批量传输 & 显存控制]
     阶段一和阶段二：生成和筛选优质思考片段。
+    通过在GPU上累积数据并批量传输到CPU来减少通信开销。
     """
-    all_filtered_data_gpu = []
+    all_filtered_data_cpu = []
     total_samples_generated = 0
+
+    # 在GPU上临时累积数据的列表
+    gpu_accumulator = []
+    # 设置一个阈值，比如累积多少个批次的数据后再一次性传输
+    ACCUMULATION_THRESHOLD = 4  # 累积16个批次的数据，可以根据您的显存大小调整
 
     pbar = tqdm(total=len(ensemble_models) * len(data_loader),
                 desc="[Phase 1&2] Generating & Filtering Data")
@@ -85,12 +91,9 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
         original_iterations = model.iterations
         model.iterations = args.data_gen_ticks
 
-        batch_start_time = time.time()
         for batch_idx, (inputs, targets) in enumerate(data_loader):
-            tqdm.write(
-                f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Processing...")
-
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device,
+                                                                               non_blocking=True)  # 使用 non_blocking=True
             batch_size = inputs.size(0)
 
             with torch.no_grad():
@@ -102,9 +105,9 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                         pbar.update(1)
                         continue
 
+                # ... (此处数据筛选逻辑与之前版本完全相同) ...
                 all_predictions = state_history_tensors["prediction"].float().permute(1, 2, 0)
                 all_certainties = state_history_tensors["certainty"].float().permute(1, 2, 0)
-
                 reshaped_preds_for_loss = all_predictions.reshape(batch_size, args.parity_sequence_length, 2,
                                                                   args.data_gen_ticks).permute(0, 3, 1, 2).reshape(-1,
                                                                                                                    args.parity_sequence_length,
@@ -116,7 +119,6 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 ).reshape(batch_size, args.data_gen_ticks, args.parity_sequence_length)
                 losses_all_ticks = per_element_loss.mean(dim=2)
                 certainties_all_ticks = all_certainties[:, 1, :]
-
                 losses_tm1, losses_t, losses_tp1 = losses_all_ticks[:, :-2], losses_all_ticks[:, 1:-1], \
                     losses_all_ticks[:, 2:]
                 certs_tm1, certs_t = certainties_all_ticks[:, :-2], certainties_all_ticks[:, 1:-1]
@@ -128,14 +130,12 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                 if batch_indices.numel() > 0:
                     num_found = batch_indices.numel()
                     total_samples_generated += num_found
-                    tqdm.write(
-                        f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Found {num_found} good samples!")
 
                     input_tick_indices = tick_indices_t
                     target_tick_indices = tick_indices_t + 2
 
                     batch_data = {}
-                    batch_data["kv"] = model.compute_features(inputs)[batch_indices].detach()
+                    batch_data["input_kv"] = model.compute_features(inputs)[batch_indices].detach()
                     batch_data["targets"] = targets[batch_indices].detach()
 
                     for key, tensor_history in state_history_tensors.items():
@@ -143,30 +143,46 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                         batch_data[f"input_{key}"] = tensor_history[input_tick_indices, batch_indices].detach()
                         batch_data[f"target_{key}"] = tensor_history[target_tick_indices, batch_indices].detach()
 
-                    all_filtered_data_gpu.append(batch_data)
+                    # 将筛选出的数据累积在GPU列表中
+                    gpu_accumulator.append(batch_data)
+
+            # 检查是否达到了传输阈值
+            if len(gpu_accumulator) >= ACCUMULATION_THRESHOLD:
+                tqdm.write(f"Accumulation threshold reached. Transferring {len(gpu_accumulator)} batches to CPU...")
+                # 批量合并和传输
+                if gpu_accumulator:
+                    consolidated_batch = {}
+                    keys = gpu_accumulator[0].keys()
+                    for key in keys:
+                        consolidated_batch[key] = torch.cat([d[key] for d in gpu_accumulator], dim=0).cpu()
+                    all_filtered_data_cpu.append(consolidated_batch)
+                    gpu_accumulator.clear()  # 清空GPU累积器
 
             pbar.update(1)
-            batch_end_time = time.time()
-            tqdm.write(
-                f"[DEBUG] {time.strftime('%H:%M:%S')} - Model {model_idx + 1}, Batch {batch_idx + 1}: Time taken: {batch_end_time - batch_start_time:.2f}s")
-            batch_start_time = time.time()
 
         model.iterations = original_iterations
 
+    # 在所有循环结束后，处理剩余在累积器中的数据
+    if gpu_accumulator:
+        tqdm.write(f"Transferring remaining {len(gpu_accumulator)} batches to CPU...")
+        consolidated_batch = {}
+        keys = gpu_accumulator[0].keys()
+        for key in keys:
+            consolidated_batch[key] = torch.cat([d[key] for d in gpu_accumulator], dim=0).cpu()
+        all_filtered_data_cpu.append(consolidated_batch)
+        gpu_accumulator.clear()
+
     pbar.close()
 
-    tqdm.write(
-        f"[DEBUG] {time.strftime('%H:%M:%S')} - TOTAL SAMPLES GENERATED IN THIS EPOCH: {total_samples_generated}")
-
-    if not all_filtered_data_gpu:
+    if not all_filtered_data_cpu:
         tqdm.write("[WARNING] No expert transition samples were generated in this epoch.")
         return None
 
-    tqdm.write("Consolidating and transferring data to CPU...")
+    tqdm.write("Consolidating final data on CPU...")
     final_expert_data = {}
-    keys = all_filtered_data_gpu[0].keys()
+    keys = all_filtered_data_cpu[0].keys()
     for key in keys:
-        final_expert_data[key] = torch.cat([d[key] for d in all_filtered_data_gpu], dim=0).cpu()
+        final_expert_data[key] = torch.cat([d[key] for d in all_filtered_data_cpu], dim=0)
 
     tqdm.write(f"Generated and filtered a total of {final_expert_data['targets'].shape[0]} expert transition samples.")
     return final_expert_data
@@ -271,7 +287,7 @@ if __name__ == '__main__':
         print(f"Could not perform pseudo-forward pass: {e}")
 
     print("Initializing InMemoryParityDataset...")
-    train_data = InMemoryParityDataset(sequence_length=args.parity_sequence_length, length=10000)
+    train_data = InMemoryParityDataset(sequence_length=args.parity_sequence_length, length=100)
     train_loader = DataLoader(train_data,
                               batch_size=args.batch_size,
                               shuffle=True,
