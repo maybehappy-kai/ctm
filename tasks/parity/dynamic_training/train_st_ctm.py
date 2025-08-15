@@ -200,16 +200,24 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
     return final_expert_data
 
 
+# 修改后的逻辑
 def define_state_loss(predicted_states, target_states):
-    """
-    定义用于比较两个状态包的损失函数。
-    """
-    total_loss = 0
-    total_loss += torch.nn.functional.mse_loss(predicted_states[0]["activated_state"], target_states["activated_state"])
-    total_loss += torch.nn.functional.mse_loss(predicted_states[1]["activated_state"], target_states["activated_state"])
-    total_loss += torch.nn.functional.mse_loss(predicted_states[0]["attention_output"],
-                                               target_states["attention_output"])
-    total_loss += torch.nn.functional.mse_loss(predicted_states[1]["prediction"], target_states["prediction"])
+    # predicted_states[0] 是第一个tick的中间状态，我们忽略它对损失的直接贡献
+    # predicted_states[1] 是第二个tick的最终状态，这是我们关心的
+
+    final_predicted_state = predicted_states[1]
+
+    # 计算最终状态与目标状态之间的差异
+    # 您可以根据需要选择性地比较状态包中的哪些部分
+    loss_activated_state = torch.nn.functional.mse_loss(final_predicted_state["activated_state"],
+                                                        target_states["activated_state"])
+    loss_attention_output = torch.nn.functional.mse_loss(final_predicted_state["attention_output"],
+                                                         target_states["attention_output"])
+    loss_prediction = torch.nn.functional.mse_loss(final_predicted_state["prediction"], target_states["prediction"])
+
+    # 将各部分损失相加（可以考虑加权）
+    total_loss = loss_activated_state + loss_attention_output + loss_prediction
+
     return total_loss
 
 
