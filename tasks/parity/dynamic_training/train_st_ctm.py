@@ -154,9 +154,21 @@ def generate_and_filter_data(ensemble_models, data_loader, args, device, predict
                     consolidated_batch = {}
                     keys = gpu_accumulator[0].keys()
                     for key in keys:
+                        # 合并张量并立即转移到CPU
                         consolidated_batch[key] = torch.cat([d[key] for d in gpu_accumulator], dim=0).cpu()
                     all_filtered_data_cpu.append(consolidated_batch)
-                    gpu_accumulator.clear()  # 清空GPU累积器
+
+                    # --- 核心修改 ---
+                    # 1. 清空GPU累积器列表
+                    gpu_accumulator.clear()
+
+                    # 2. (可选但推荐) 显式删除中间变量，帮助Python垃圾回收
+                    del consolidated_batch
+
+                    # 3. (关键步骤) 强制PyTorch释放缓存的显存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # ---------------
 
             pbar.update(1)
 
