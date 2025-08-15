@@ -606,3 +606,63 @@ class ContinuousThoughtMachine(nn.Module):
                 pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
 
         return predictions, certainties, synchronisation_out
+
+    def run_two_ticks(self, initial_states):
+        """
+        接收一个初始状态字典，执行两次CTM的内部迭代，并返回中间和最终的状态。
+        """
+        # --- 从输入字典中解包初始状态 ---
+        activated_state = initial_states["activated_state"]
+        state_trace = initial_states["state_trace"]
+        kv = initial_states["kv"]  # kv 是预先计算好的特征
+        B, device = activated_state.shape[0], activated_state.device
+
+        # --- 初始化递归同步值 ---
+        decay_alpha_action, decay_beta_action = None, None
+        decay_alpha_out, decay_beta_out = None, None
+
+        # 确保衰减参数被钳位
+        self.decay_params_action.data = torch.clamp(self.decay_params_action.data, 0, 15)
+        self.decay_params_out.data = torch.clamp(self.decay_params_out.data, 0, 15)
+
+        r_action = torch.exp(-self.decay_params_action).unsqueeze(0).expand(B, -1)
+        r_out = torch.exp(-self.decay_params_out).unsqueeze(0).expand(B, -1)
+
+        # 存储两次迭代结果的列表
+        output_states = []
+
+        # --- 执行两次迭代 ---
+        for _ in range(2):
+            # --- 核心迭代逻辑 (从 forward 方法中提取) ---
+            synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
+                activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action'
+            )
+            q = self.q_proj(synchronisation_action).unsqueeze(1)
+            attn_out, _ = self.attention(q, kv, kv, average_attn_weights=False, need_weights=False)
+            attn_out = attn_out.squeeze(1)
+
+            pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
+            state = self.synapses(pre_synapse_input)
+            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+
+            activated_state = self.trace_processor(state_trace)
+
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
+                activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out'
+            )
+
+            current_prediction = self.output_projector(synchronisation_out)
+            current_certainty = self.compute_certainty(current_prediction)
+
+            # --- 将当前迭代的状态打包成字典并存储 ---
+            current_state_package = {
+                "activated_state": activated_state,
+                "state_trace": state_trace,
+                "attention_output": attn_out,
+                "prediction": current_prediction,
+                "certainty": current_certainty,
+            }
+            output_states.append(current_state_package)
+
+        # 返回两次迭代的状态和一个空的占位符（匹配训练脚本的解包方式）
+        return output_states, None
